@@ -1,0 +1,363 @@
+import streamlit as st
+import fitz  # PyMuPDF
+import json
+import re
+from datetime import datetime
+import tempfile
+import os
+
+def clean_text(text):
+    """Clean and fix encoding issues in extracted text"""
+    if not text:
+        return text
+    
+    # Try to fix common encoding issues
+    try:
+        # Remove null bytes and control characters
+        text = text.replace('\x00', '')
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        
+        # Try different encoding fixes
+        if any(ord(c) > 127 for c in text):
+            # Try to decode as latin-1 then encode as utf-8
+            try:
+                text = text.encode('latin-1').decode('utf-8')
+            except:
+                pass
+        
+        # Replace common problematic characters
+        replacements = {
+            'â€™': "'",
+            'â€œ': '"',
+            'â€': '"',
+            'â€¢': '•',
+            'â€"': '—',
+            'â€"': '–',
+            'Â': ' ',
+            'Ã¡': 'á',
+            'Ã©': 'é',
+            'Ã­': 'í',
+            'Ã³': 'ó',
+            'Ãº': 'ú',
+        }
+        
+        for bad, good in replacements.items():
+            text = text.replace(bad, good)
+        
+        return text
+    except:
+        return text
+
+def extract_text_from_pdf(pdf_file):
+    """Extract text from PDF using PyMuPDF with encoding fixes"""
+    try:
+        # Save uploaded file to temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(pdf_file.read())
+            tmp_file_path = tmp_file.name
+
+        # Open PDF and extract text
+        doc = fitz.open(tmp_file_path)
+        
+        # Diagnostic information
+        diagnostic_info = {
+            "page_count": len(doc),
+            "is_encrypted": doc.needs_pass,
+            "metadata": doc.metadata,
+            "extraction_methods": []
+        }
+        
+        full_text = ""
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            # Try multiple extraction methods
+            extraction_results = {}
+            
+            # Method 1: Standard text extraction
+            try:
+                text_plain = page.get_text()
+                text_plain = clean_text(text_plain)
+                extraction_results["plain"] = {
+                    "length": len(text_plain),
+                    "preview": text_plain[:100] if text_plain else "Empty",
+                    "success": bool(text_plain and not all(ord(c) > 127 for c in text_plain[:50]))
+                }
+            except Exception as e:
+                extraction_results["plain"] = {"error": str(e)}
+            
+            # Method 2: Dictionary method with character codes
+            try:
+                text_dict = page.get_text("dict")
+                dict_text = ""
+                for block in text_dict.get("blocks", []):
+                    if "lines" in block:
+                        for line in block["lines"]:
+                            for span in line.get("spans", []):
+                                span_text = span.get("text", "")
+                                dict_text += span_text + " "
+                            dict_text += "\n"
+                
+                dict_text = clean_text(dict_text)
+                extraction_results["dict"] = {
+                    "length": len(dict_text),
+                    "preview": dict_text[:100] if dict_text else "Empty",
+                    "success": bool(dict_text and not all(ord(c) > 127 for c in dict_text[:50]))
+                }
+            except Exception as e:
+                extraction_results["dict"] = {"error": str(e)}
+            
+            # Method 3: Raw text blocks
+            try:
+                text_blocks = page.get_text("blocks")
+                blocks_text = ""
+                for block in text_blocks:
+                    if len(block) >= 5:  # text blocks have at least 5 elements
+                        blocks_text += str(block[4]) + "\n"
+                
+                blocks_text = clean_text(blocks_text)
+                extraction_results["blocks"] = {
+                    "length": len(blocks_text),
+                    "preview": blocks_text[:100] if blocks_text else "Empty",
+                    "success": bool(blocks_text and not all(ord(c) > 127 for c in blocks_text[:50]))
+                }
+            except Exception as e:
+                extraction_results["blocks"] = {"error": str(e)}
+            
+            # Method 4: HTML extraction
+            try:
+                text_html = page.get_text("html")
+                # Strip HTML tags
+                import re
+                html_text = re.sub(r'<[^>]+>', '', text_html)
+                html_text = clean_text(html_text)
+                extraction_results["html"] = {
+                    "length": len(html_text),
+                    "preview": html_text[:100] if html_text else "Empty",
+                    "success": bool(html_text and not all(ord(c) > 127 for c in html_text[:50]))
+                }
+            except Exception as e:
+                extraction_results["html"] = {"error": str(e)}
+            
+            # Check if page has images (might be scanned)
+            image_list = page.get_images()
+            has_images = len(image_list) > 0
+            
+            # Choose the best extraction method
+            best_method = None
+            best_text = ""
+            
+            for method, result in extraction_results.items():
+                if isinstance(result, dict) and result.get("success") and result.get("length", 0) > 0:
+                    if not best_method or result["length"] > extraction_results[best_method]["length"]:
+                        best_method = method
+                        if method == "plain":
+                            best_text = text_plain
+                        elif method == "dict":
+                            best_text = dict_text
+                        elif method == "blocks":
+                            best_text = blocks_text
+                        elif method == "html":
+                            best_text = html_text
+            
+            # Add page results
+            page_header = f"\n=== PAGE {page_num + 1} ===\n"
+            page_header += f"Images found: {len(image_list)}\n"
+            page_header += f"Best extraction method: {best_method or 'None'}\n"
+            
+            # Show all method results for debugging
+            for method, result in extraction_results.items():
+                if isinstance(result, dict):
+                    if "error" in result:
+                        page_header += f"{method.upper()}: ERROR - {result['error']}\n"
+                    else:
+                        page_header += f"{method.upper()}: {result['length']} chars, Success: {result['success']}\n"
+                        page_header += f"  Preview: {result['preview'][:50]}...\n"
+            
+            page_header += "=== EXTRACTED TEXT ===\n"
+            
+            full_text += page_header
+            
+            if best_text:
+                full_text += best_text
+            elif has_images:
+                full_text += "[This appears to be a scanned PDF with images - OCR would be needed]\n"
+            else:
+                full_text += "[No readable text could be extracted from this page]\n"
+            
+            full_text += "\n=== END PAGE ===\n"
+        
+        doc.close()
+        
+        # Clean up temporary file
+        os.unlink(tmp_file_path)
+        
+        # Add overall diagnostic info
+        diagnostic_text = f"=== PDF DIAGNOSTICS ===\n"
+        diagnostic_text += f"Pages: {diagnostic_info['page_count']}\n"
+        diagnostic_text += f"Encrypted: {diagnostic_info['is_encrypted']}\n"
+        diagnostic_text += f"Creator: {diagnostic_info['metadata'].get('creator', 'N/A')}\n"
+        diagnostic_text += f"Producer: {diagnostic_info['metadata'].get('producer', 'N/A')}\n"
+        diagnostic_text += "=== END DIAGNOSTICS ===\n\n"
+        
+        return diagnostic_text + full_text
+        
+    except Exception as e:
+        return f"Error extracting text: {str(e)}"
+
+def parse_invoice_data(text):
+    """Parse common invoice fields from extracted text"""
+    invoice_data = {
+        "raw_text": text,
+        "extracted_fields": {},
+        "extraction_method": "PyMuPDF",
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    # Common patterns for invoice data extraction
+    patterns = {
+        "invoice_number": [
+            r"Invoice\s*#?\s*:?\s*(\w+[-]?\w*)",
+            r"Invoice\s*Number\s*:?\s*(\w+[-]?\w*)",
+            r"INV\s*#?\s*:?\s*(\w+[-]?\w*)"
+        ],
+        "invoice_date": [
+            r"Invoice\s*Date\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+            r"Date\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        ],
+        "total_amount": [
+            r"Total\s*:?\s*\$?(\d+[,.]?\d*\.?\d{0,2})",
+            r"Amount\s*Due\s*:?\s*\$?(\d+[,.]?\d*\.?\d{0,2})",
+            r"Grand\s*Total\s*:?\s*\$?(\d+[,.]?\d*\.?\d{0,2})"
+        ],
+        "vendor_name": [
+            r"From\s*:?\s*([A-Za-z\s&,.]+?)(?:\n|$)",
+            r"Bill\s*From\s*:?\s*([A-Za-z\s&,.]+?)(?:\n|$)"
+        ]
+    }
+    
+    # Extract fields using regex patterns
+    for field, pattern_list in patterns.items():
+        for pattern in pattern_list:
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+            if match:
+                invoice_data["extracted_fields"][field] = match.group(1).strip()
+                break
+        
+        # If no match found, set as null
+        if field not in invoice_data["extracted_fields"]:
+            invoice_data["extracted_fields"][field] = None
+    
+    # Extract line items (simplified)
+    line_items = []
+    lines = text.split('\n')
+    
+    for line in lines:
+        # Look for lines that might be line items (contain quantity, description, price)
+        if re.search(r'\d+\s+.*\s+\$?\d+\.?\d{0,2}', line):
+            line_items.append(line.strip())
+    
+    invoice_data["extracted_fields"]["line_items"] = line_items[:10]  # Limit to first 10
+    
+    return invoice_data
+
+def main():
+    st.set_page_config(
+        page_title="PDF Invoice Data Extractor",
+        page_icon="📄",
+        layout="wide"
+    )
+    
+    st.title("📄 PDF Invoice Data Extractor")
+    st.markdown("Upload a PDF invoice to extract data using PyMuPDF and see the results as JSON")
+    
+    # File uploader
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file",
+        type="pdf",
+        help="Upload an invoice PDF to extract text and structured data"
+    )
+    
+    if uploaded_file is not None:
+        st.success(f"File uploaded: {uploaded_file.name}")
+        
+        # Create columns for layout
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("🔍 Processing Options")
+            
+            show_raw_text = st.checkbox("Show raw extracted text", value=False)
+            
+            if st.button("Extract Data", type="primary"):
+                with st.spinner("Extracting text from PDF..."):
+                    # Extract text from PDF
+                    extracted_text = extract_text_from_pdf(uploaded_file)
+                    
+                    if "Error" in extracted_text:
+                        st.error(extracted_text)
+                    else:
+                        # Parse invoice data
+                        invoice_data = parse_invoice_data(extracted_text)
+                        
+                        st.success("✅ Data extraction completed!")
+                        
+                        # Display results
+                        with col2:
+                            st.subheader("📊 Extracted Data (JSON)")
+                            
+                            # Pretty print JSON
+                            json_str = json.dumps(invoice_data, indent=2, ensure_ascii=False)
+                            st.code(json_str, language='json')
+                            
+                            # Download button
+                            st.download_button(
+                                label="⬇️ Download JSON",
+                                data=json_str,
+                                file_name=f"extracted_data_{uploaded_file.name}.json",
+                                mime="application/json"
+                            )
+                        
+                        # Show raw text if requested
+                        if show_raw_text:
+                            st.subheader("📝 Raw Extracted Text")
+                            with st.expander("Click to view raw text"):
+                                st.text(extracted_text)
+                        
+                        # Summary statistics
+                        st.subheader("📈 Extraction Summary")
+                        col_stat1, col_stat2, col_stat3 = st.columns(3)
+                        
+                        with col_stat1:
+                            st.metric("Characters Extracted", len(extracted_text))
+                        
+                        with col_stat2:
+                            fields_found = len([v for v in invoice_data["extracted_fields"].values() if v is not None])
+                            st.metric("Fields Extracted", fields_found)
+                        
+                        with col_stat3:
+                            line_items_count = len(invoice_data["extracted_fields"]["line_items"])
+                            st.metric("Line Items Found", line_items_count)
+
+    else:
+        # Instructions
+        st.info("""
+        **How to use:**
+        1. Upload a PDF invoice using the file uploader above
+        2. Click 'Extract Data' to process the document
+        3. View the extracted data in JSON format
+        4. Download the results or copy the JSON for further processing
+        
+        **What this extracts:**
+        - Invoice number
+        - Invoice date  
+        - Total amount
+        - Vendor name
+        - Line items (simplified)
+        - Raw text content
+        """)
+
+if __name__ == "__main__":
+    main()
