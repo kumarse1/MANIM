@@ -1,0 +1,540 @@
+import streamlit as st
+import json
+import re
+from datetime import datetime
+import tempfile
+import os
+import io
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import pandas as pd
+
+# Required libraries
+try:
+    import fitz  # PyMuPDF
+    import pytesseract
+    from PIL import Image, ImageDraw
+    import cv2
+    import numpy as np
+    LIBRARIES_AVAILABLE = True
+    
+    # Set Windows tesseract path
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+except ImportError as e:
+    LIBRARIES_AVAILABLE = False
+    st.error(f"Missing libraries: {e}")
+
+@dataclass
+class LineItem:
+    item_number: str = ""
+    description: str = ""
+    quantity: str = ""
+    unit_price: str = ""
+    total_price: str = ""
+    confidence: float = 0.0
+    bounding_box: Tuple[int, int, int, int] = None
+
+@dataclass
+class TableRegion:
+    x: int
+    y: int
+    width: int
+    height: int
+    confidence: float = 0.0
+
+class DynamicLineItemProcessor:
+    def __init__(self):
+        self.vendor_patterns = self.load_vendor_patterns()
+    
+    def load_vendor_patterns(self):
+        """Define patterns for different vendors to identify table regions"""
+        return {
+            "acme": {
+                "table_start_keywords": ["Item", "Description", "Qty", "Price", "Total"],
+                "table_end_keywords": ["Subtotal", "Tax", "Total Due"],
+                "column_patterns": {
+                    "item_number": r"\\b\\d{3,6}\\b",
+                    "description": r"[A-Za-z][A-Za-z\\s-]{5,50}",
+                    "quantity": r"\\b\\d{1,3}\\b",
+                    "unit_price": r"\\$?\\d+\\.\\d{2}",
+                    "total_price": r"\\$?\\d+\\.\\d{2}"
+                }
+            },
+            "techsupply": {
+                "table_start_keywords": ["Part#", "Item", "Qty", "Unit Cost", "Amount"],
+                "table_end_keywords": ["Subtotal", "Sales Tax", "Total"],
+                "column_patterns": {
+                    "item_number": r"TS-\\d{4,}",
+                    "description": r"[A-Za-z][A-Za-z\\s-]{10,60}",
+                    "quantity": r"\\b\\d{1,4}\\b",
+                    "unit_price": r"\\$\\d+\\.\\d{2}",
+                    "total_price": r"\\$\\d+\\.\\d{2}"
+                }
+            },
+            "generic": {
+                "table_start_keywords": ["Item", "Description", "Quantity", "Price", "Amount", "Total"],
+                "table_end_keywords": ["Subtotal", "Tax", "Total", "Amount Due"],
+                "column_patterns": {
+                    "item_number": r"\\b[A-Z0-9-]{3,10}\\b",
+                    "description": r"[A-Za-z][A-Za-z\\s-]{5,50}",
+                    "quantity": r"\\b\\d{1,4}\\b",
+                    "unit_price": r"\\$?\\d+\\.\\d{2}",
+                    "total_price": r"\\$?\\d+\\.\\d{2}"
+                }
+            }
+        }
+    
+    def extract_text_with_coordinates(self, pdf_file):
+        """Extract text with coordinate information"""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                tmp_file.write(pdf_file.read())
+                tmp_file_path = tmp_file.name
+
+            doc = fitz.open(tmp_file_path)
+            
+            # Get first page (most invoices are single page)
+            page = doc[0]
+            
+            # Convert to image for OCR
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_data = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+            
+            # Get OCR data with coordinates
+            ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            
+            # Get plain text too
+            full_text = pytesseract.image_to_string(img, lang='eng')
+            
+            doc.close()
+            os.unlink(tmp_file_path)
+            
+            return {
+                "full_text": full_text,
+                "ocr_data": ocr_data,
+                "image": img,
+                "image_size": img.size
+            }
+            
+        except Exception as e:
+            return {"error": f"OCR Error: {str(e)}"}
+    
+    def detect_table_region(self, ocr_data, vendor_type="generic"):
+        """Detect the table region dynamically based on keywords"""
+        patterns = self.vendor_patterns[vendor_type]
+        
+        # Find table start
+        table_start_y = None
+        table_end_y = None
+        
+        words = ocr_data['text']
+        tops = ocr_data['top']
+        lefts = ocr_data['left']
+        widths = ocr_data['width']
+        heights = ocr_data['height']
+        
+        # Find start of table
+        for i, word in enumerate(words):
+            if word.strip() and any(keyword.lower() in word.lower() for keyword in patterns["table_start_keywords"]):
+                table_start_y = tops[i]
+                break
+        
+        # Find end of table
+        for i, word in enumerate(words):
+            if word.strip() and any(keyword.lower() in word.lower() for keyword in patterns["table_end_keywords"]):
+                if table_start_y and tops[i] > table_start_y:
+                    table_end_y = tops[i]
+                    break
+        
+        if table_start_y is None:
+            return None
+        
+        if table_end_y is None:
+            # Use bottom 25% of image if no end found
+            table_end_y = max(tops) + max(heights)
+        
+        # Calculate table bounds
+        table_left = min([lefts[i] for i, word in enumerate(words) if table_start_y <= tops[i] <= table_end_y and word.strip()])
+        table_right = max([lefts[i] + widths[i] for i, word in enumerate(words) if table_start_y <= tops[i] <= table_end_y and word.strip()])
+        
+        return TableRegion(
+            x=table_left,
+            y=table_start_y,
+            width=table_right - table_left,
+            height=table_end_y - table_start_y,
+            confidence=0.8
+        )
+    
+    def extract_line_items_from_region(self, ocr_data, table_region, vendor_type="generic"):
+        """Extract line items from the detected table region"""
+        if not table_region:
+            return []
+        
+        patterns = self.vendor_patterns[vendor_type]
+        
+        # Filter words within table region
+        table_words = []
+        words = ocr_data['text']
+        tops = ocr_data['top']
+        lefts = ocr_data['left']
+        widths = ocr_data['width']
+        heights = ocr_data['height']
+        confidences = ocr_data['conf']
+        
+        for i, word in enumerate(words):
+            if (word.strip() and confidences[i] > 30 and  # Filter low confidence
+                table_region.x <= lefts[i] <= table_region.x + table_region.width and
+                table_region.y <= tops[i] <= table_region.y + table_region.height):
+                
+                table_words.append({
+                    'text': word,
+                    'x': lefts[i],
+                    'y': tops[i],
+                    'width': widths[i],
+                    'height': heights[i],
+                    'confidence': confidences[i]
+                })
+        
+        # Group words by rows (similar Y coordinates)
+        rows = self.group_words_by_rows(table_words)
+        
+        # Extract line items from rows
+        line_items = []
+        for row_words in rows:
+            line_item = self.parse_row_to_line_item(row_words, patterns)
+            if line_item and any([line_item.item_number, line_item.description, line_item.quantity]):
+                line_items.append(line_item)
+        
+        return line_items
+    
+    def group_words_by_rows(self, words, tolerance=10):
+        """Group words into rows based on Y coordinates"""
+        if not words:
+            return []
+        
+        # Sort by Y coordinate
+        words.sort(key=lambda w: w['y'])
+        
+        rows = []
+        current_row = [words[0]]
+        current_y = words[0]['y']
+        
+        for word in words[1:]:
+            if abs(word['y'] - current_y) <= tolerance:
+                current_row.append(word)
+            else:
+                if current_row:
+                    rows.append(sorted(current_row, key=lambda w: w['x']))
+                current_row = [word]
+                current_y = word['y']
+        
+        if current_row:
+            rows.append(sorted(current_row, key=lambda w: w['x']))
+        
+        return rows
+    
+    def parse_row_to_line_item(self, row_words, patterns):
+        """Parse a row of words into a line item"""
+        if len(row_words) < 2:  # Need at least 2 words for a valid line item
+            return None
+        
+        # Combine all text in the row
+        row_text = " ".join([w['text'] for w in row_words])
+        
+        # Skip header rows
+        header_keywords = ["Item", "Description", "Qty", "Price", "Total", "Part#", "Amount"]
+        if any(keyword.lower() in row_text.lower() for keyword in header_keywords):
+            return None
+        
+        line_item = LineItem()
+        
+        # Extract fields using patterns
+        for field, pattern in patterns["column_patterns"].items():
+            matches = re.findall(pattern, row_text, re.IGNORECASE)
+            if matches:
+                if field == "item_number":
+                    line_item.item_number = matches[0]
+                elif field == "quantity":
+                    # Take the first number that looks like a quantity
+                    line_item.quantity = matches[0]
+                elif field == "unit_price":
+                    # Take the first price
+                    line_item.unit_price = matches[0].replace('$', '')
+                elif field == "total_price":
+                    # Take the last price (usually the total)
+                    line_item.total_price = matches[-1].replace('$', '')
+        
+        # Extract description (everything that's not a number or price)
+        description_words = []
+        for word in row_words:
+            text = word['text'].strip()
+            if (text and not re.match(r'^\\$?\\d+\\.?\\d*$', text) and 
+                not re.match(r'^\\d{1,4}$', text) and
+                len(text) > 2):
+                description_words.append(text)
+        
+        line_item.description = " ".join(description_words[:5])  # Limit description length
+        
+        # Calculate confidence based on how many fields we found
+        fields_found = sum([1 for field in [line_item.item_number, line_item.description, 
+                          line_item.quantity, line_item.unit_price, line_item.total_price] 
+                          if field])
+        line_item.confidence = min(fields_found / 5.0, 1.0)
+        
+        return line_item
+    
+    def visualize_table_detection(self, image, table_region, line_items):
+        """Create a visualization showing detected table and line items"""
+        if not table_region:
+            return image
+        
+        # Create a copy for drawing
+        vis_image = image.copy()
+        draw = ImageDraw.Draw(vis_image)
+        
+        # Draw table region
+        draw.rectangle([
+            table_region.x, table_region.y,
+            table_region.x + table_region.width,
+            table_region.y + table_region.height
+        ], outline="red", width=3)
+        
+        # Add text
+        draw.text((table_region.x, table_region.y - 20), 
+                 f"Table Region (Items: {len(line_items)})", 
+                 fill="red")
+        
+        return vis_image
+    
+    def process_invoice_with_dynamic_line_items(self, pdf_file, vendor_type="generic"):
+        """Complete processing pipeline for dynamic line items"""
+        
+        # Step 1: Extract text with coordinates
+        st.info("🔍 Step 1: Extracting text with coordinate data...")
+        extraction_result = self.extract_text_with_coordinates(pdf_file)
+        
+        if "error" in extraction_result:
+            return extraction_result
+        
+        # Step 2: Detect table region
+        st.info("📋 Step 2: Detecting table region dynamically...")
+        table_region = self.detect_table_region(extraction_result["ocr_data"], vendor_type)
+        
+        if not table_region:
+            return {"error": "Could not detect table region in invoice"}
+        
+        # Step 3: Extract line items from table
+        st.info(f"📦 Step 3: Extracting line items from table region...")
+        line_items = self.extract_line_items_from_region(
+            extraction_result["ocr_data"], table_region, vendor_type
+        )
+        
+        # Step 4: Create visualization
+        vis_image = self.visualize_table_detection(
+            extraction_result["image"], table_region, line_items
+        )
+        
+        return {
+            "vendor_type": vendor_type,
+            "table_region": {
+                "x": table_region.x,
+                "y": table_region.y, 
+                "width": table_region.width,
+                "height": table_region.height,
+                "confidence": table_region.confidence
+            },
+            "line_items_count": len(line_items),
+            "line_items": [
+                {
+                    "item_number": item.item_number,
+                    "description": item.description,
+                    "quantity": item.quantity,
+                    "unit_price": item.unit_price,
+                    "total_price": item.total_price,
+                    "confidence": item.confidence
+                }
+                for item in line_items
+            ],
+            "full_text": extraction_result["full_text"],
+            "visualization": vis_image,
+            "timestamp": datetime.now().isoformat(),
+            "processing_method": "Dynamic Table Detection + Line Item Extraction"
+        }
+
+def main():
+    st.set_page_config(
+        page_title="Dynamic Line Items Processor",
+        page_icon="📦",
+        layout="wide"
+    )
+    
+    st.title("📦 Dynamic Line Items Invoice Processor")
+    st.markdown("""
+    **Solves the dynamic line items challenge:**
+    - ✅ **1 item or 100 items** - adapts automatically
+    - ✅ **Detects table regions** - finds start/end dynamically  
+    - ✅ **Extracts all line items** - no fixed bounding boxes
+    - ✅ **Works across vendors** - different table formats
+    """)
+    
+    if not LIBRARIES_AVAILABLE:
+        st.error("Missing required libraries!")
+        return
+    
+    # Initialize processor
+    processor = DynamicLineItemProcessor()
+    
+    # Sidebar - Processing Options
+    with st.sidebar:
+        st.header("⚙️ Processing Options")
+        
+        vendor_type = st.selectbox(
+            "Vendor Type",
+            ["generic", "acme", "techsupply"],
+            help="Choose vendor type for optimized patterns"
+        )
+        
+        st.header("📋 How It Works")
+        st.info("""
+        **1. Table Detection:**
+        - Searches for table headers ("Item", "Qty", "Price")
+        - Finds table boundaries dynamically
+        - Works regardless of table size
+        
+        **2. Row Extraction:**
+        - Groups words by Y-coordinates into rows
+        - Filters out headers and footers
+        - Handles variable column layouts
+        
+        **3. Field Parsing:**
+        - Uses regex patterns per vendor
+        - Extracts item#, description, qty, prices
+        - Provides confidence scores
+        """)
+    
+    # Main interface
+    uploaded_file = st.file_uploader("Upload Invoice PDF", type="pdf")
+    
+    if uploaded_file:
+        st.success(f"✅ File uploaded: {uploaded_file.name}")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            if st.button("🚀 Process Dynamic Line Items", type="primary"):
+                with st.spinner("Processing invoice with dynamic line items..."):
+                    uploaded_file.seek(0)
+                    result = processor.process_invoice_with_dynamic_line_items(
+                        uploaded_file, vendor_type
+                    )
+                    
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.success("✅ Dynamic processing completed!")
+                        st.session_state.result = result
+        
+        # Display results
+        if hasattr(st.session_state, 'result') and st.session_state.result:
+            result = st.session_state.result
+            
+            with col2:
+                st.subheader("📊 Processing Summary")
+                
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    st.metric("Line Items Found", result["line_items_count"])
+                with col_b:
+                    st.metric("Vendor Type", result["vendor_type"])
+                with col_c:
+                    avg_confidence = sum([item["confidence"] for item in result["line_items"]]) / len(result["line_items"]) if result["line_items"] else 0
+                    st.metric("Avg Confidence", f"{avg_confidence:.1%}")
+            
+            # Detailed results
+            tab1, tab2, tab3, tab4 = st.tabs(["📦 Line Items", "🎯 Table Detection", "📊 JSON Export", "📄 Raw Text"])
+            
+            with tab1:
+                st.subheader("📦 Extracted Line Items")
+                
+                if result["line_items"]:
+                    # Create DataFrame for better display
+                    df_data = []
+                    for i, item in enumerate(result["line_items"], 1):
+                        df_data.append({
+                            "Row": i,
+                            "Item #": item["item_number"] or "—",
+                            "Description": item["description"] or "—", 
+                            "Qty": item["quantity"] or "—",
+                            "Unit Price": item["unit_price"] or "—",
+                            "Total": item["total_price"] or "—",
+                            "Confidence": f"{item['confidence']:.1%}"
+                        })
+                    
+                    df = pd.DataFrame(df_data)
+                    st.dataframe(df, use_container_width=True)
+                    
+                    # Download CSV
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Line Items CSV",
+                        csv,
+                        file_name=f"line_items_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.warning("No line items detected")
+            
+            with tab2:
+                st.subheader("🎯 Table Detection Visualization")
+                
+                st.write("**Table Region Detected:**")
+                table = result["table_region"]
+                st.write(f"- Position: ({table['x']}, {table['y']})")
+                st.write(f"- Size: {table['width']} × {table['height']} pixels")
+                st.write(f"- Confidence: {table['confidence']:.1%}")
+                
+                # Show visualization
+                if "visualization" in result:
+                    st.image(result["visualization"], caption="Table Detection Visualization", use_column_width=True)
+            
+            with tab3:
+                st.subheader("📊 Complete JSON Results")
+                
+                # Clean JSON without visualization
+                json_result = {k: v for k, v in result.items() if k != "visualization"}
+                json_output = json.dumps(json_result, indent=2)
+                st.code(json_output, language='json')
+                
+                st.download_button(
+                    "📥 Download JSON Results",
+                    json_output,
+                    file_name=f"dynamic_line_items_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json"
+                )
+            
+            with tab4:
+                st.subheader("📄 Raw OCR Text")
+                st.text_area("Full OCR Output", result["full_text"], height=300)
+        
+    else:
+        st.info("""
+        **This solves the dynamic line items challenge:**
+        
+        📋 **The Problem:**
+        - Invoice A: 1 line item
+        - Invoice B: 25 line items  
+        - Invoice C: 3 line items
+        - Can't use fixed bounding boxes!
+        
+        🎯 **The Solution:**
+        1. **Detect table region** dynamically (find start/end)
+        2. **Extract all rows** regardless of count
+        3. **Parse each row** into structured line items
+        4. **Adapt to vendor formats** automatically
+        
+        Upload an invoice to see it work!
+        """)
+
+if __name__ == "__main__":
+    main()
