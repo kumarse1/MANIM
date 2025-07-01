@@ -41,7 +41,10 @@ class OCRBoundingBoxExtractor:
                 img = Image.open(io.BytesIO(img_data))
                 
                 # Get detailed OCR data with bounding boxes
-                ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+                try:
+                    ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+                except Exception as ocr_error:
+                    return {"status": "error", "message": f"OCR failed: {str(ocr_error)}"}
                 
                 # Process OCR data into structured format
                 page_elements = self.process_ocr_data(ocr_data, page_num + 1, img.size)
@@ -65,50 +68,60 @@ class OCRBoundingBoxExtractor:
             }
             
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": f"Processing error: {str(e)}"}
     
     def process_ocr_data(self, ocr_data, page_number, image_size):
         """Process raw OCR data into structured elements with bounding boxes"""
         elements = []
         
-        # Extract data from OCR results
-        texts = ocr_data['text']
-        lefts = ocr_data['left']
-        tops = ocr_data['top']
-        widths = ocr_data['width']
-        heights = ocr_data['height']
-        confidences = ocr_data['conf']
-        
-        element_id = 1
-        
-        for i in range(len(texts)):
-            text = texts[i].strip()
-            confidence = confidences[i]
+        try:
+            # Extract data from OCR results
+            texts = ocr_data.get('text', [])
+            lefts = ocr_data.get('left', [])
+            tops = ocr_data.get('top', [])
+            widths = ocr_data.get('width', [])
+            heights = ocr_data.get('height', [])
+            confidences = ocr_data.get('conf', [])
             
-            # Filter out empty text and low confidence detections
-            if text and confidence > 30:  # Confidence threshold
-                element = {
-                    "element_id": element_id,
-                    "text": text,
-                    "bounding_box": {
-                        "x": int(lefts[i]),
-                        "y": int(tops[i]),
-                        "width": int(widths[i]),
-                        "height": int(heights[i])
-                    },
-                    "coordinates": {
-                        "top_left": {"x": int(lefts[i]), "y": int(tops[i])},
-                        "top_right": {"x": int(lefts[i] + widths[i]), "y": int(tops[i])},
-                        "bottom_left": {"x": int(lefts[i]), "y": int(tops[i] + heights[i])},
-                        "bottom_right": {"x": int(lefts[i] + widths[i]), "y": int(tops[i] + heights[i])}
-                    },
-                    "confidence": int(confidence),
-                    "text_length": len(text),
-                    "data_type": self.classify_data_type(text)
-                }
-                
-                elements.append(element)
-                element_id += 1
+            element_id = 1
+            
+            for i in range(len(texts)):
+                try:
+                    text = str(texts[i]).strip()
+                    confidence = int(confidences[i]) if confidences[i] != -1 else 0
+                    
+                    # Filter out empty text and low confidence detections
+                    if text and confidence > 30:  # Confidence threshold
+                        element = {
+                            "element_id": element_id,
+                            "text": text,
+                            "bounding_box": {
+                                "x": int(lefts[i]),
+                                "y": int(tops[i]),
+                                "width": int(widths[i]),
+                                "height": int(heights[i])
+                            },
+                            "coordinates": {
+                                "top_left": {"x": int(lefts[i]), "y": int(tops[i])},
+                                "top_right": {"x": int(lefts[i] + widths[i]), "y": int(tops[i])},
+                                "bottom_left": {"x": int(lefts[i]), "y": int(tops[i] + heights[i])},
+                                "bottom_right": {"x": int(lefts[i] + widths[i]), "y": int(tops[i] + heights[i])}
+                            },
+                            "confidence": confidence,
+                            "text_length": len(text),
+                            "data_type": self.classify_data_type(text)
+                        }
+                        
+                        elements.append(element)
+                        element_id += 1
+                        
+                except Exception as element_error:
+                    # Skip problematic elements
+                    continue
+        
+        except Exception as e:
+            # Return empty list if processing fails
+            pass
         
         return elements
     
@@ -116,36 +129,342 @@ class OCRBoundingBoxExtractor:
         """Classify the type of data based on text patterns"""
         import re
         
-        # Date patterns
-        if re.match(r'\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}', text):
-            return "date"
+        try:
+            # Date patterns
+            if re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text):
+                return "date"
+            
+            # Currency/price patterns
+            if re.match(r'\$?\d+[,.]?\d*\.?\d{2}', text):
+                return "currency"
+            
+            # Number patterns
+            if re.match(r'^\d+
+    
+    def create_visualization(self, pdf_file, ocr_result):
+        """Create a visualization showing bounding boxes on the image"""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                tmp_file.write(pdf_file.read())
+                tmp_file_path = tmp_file.name
+
+            doc = fitz.open(tmp_file_path)
+            page = doc[0]  # First page only
+            
+            # Convert to image
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_data = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+            
+            # Draw bounding boxes
+            draw = ImageDraw.Draw(img)
+            
+            # Colors for different data types
+            colors = {
+                "date": "red",
+                "currency": "green", 
+                "number": "blue",
+                "email": "purple",
+                "phone": "orange",
+                "invoice_number": "magenta",
+                "percentage": "cyan",
+                "text": "gray"
+            }
+            
+            if ocr_result["status"] == "success" and ocr_result["pages"]:
+                elements = ocr_result["pages"][0]["elements"]
+                
+                for element in elements:
+                    bbox = element["bounding_box"]
+                    data_type = element["data_type"]
+                    color = colors.get(data_type, "gray")
+                    
+                    # Draw rectangle
+                    draw.rectangle([
+                        bbox["x"], bbox["y"],
+                        bbox["x"] + bbox["width"],
+                        bbox["y"] + bbox["height"]
+                    ], outline=color, width=2)
+                    
+                    # Draw element ID
+                    try:
+                        draw.text((bbox["x"], bbox["y"] - 15), 
+                                str(element["element_id"]), 
+                                fill=color)
+                    except:
+                        pass  # Skip if font issues
+            
+            doc.close()
+            os.unlink(tmp_file_path)
+            
+            return img
+            
+        except Exception as e:
+            return None
+    
+    def filter_elements_by_type(self, ocr_result, data_types):
+        """Filter elements by data type"""
+        if ocr_result["status"] != "success":
+            return ocr_result
         
-        # Currency/price patterns
-        if re.match(r'\\$?\\d+[,.]?\\d*\\.\\d{2}', text):
-            return "currency"
+        filtered_result = ocr_result.copy()
         
-        # Number patterns
-        if re.match(r'^\\d+$', text):
-            return "number"
+        for page in filtered_result["pages"]:
+            page["elements"] = [
+                element for element in page["elements"]
+                if element["data_type"] in data_types
+            ]
+            page["total_elements"] = len(page["elements"])
         
-        # Email patterns
-        if re.match(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}', text):
-            return "email"
+        return filtered_result
+
+def main():
+    st.set_page_config(
+        page_title="OCR Bounding Box Extractor",
+        page_icon="📍",
+        layout="wide"
+    )
+    
+    st.title("📍 OCR Bounding Box Extractor")
+    st.markdown("""
+    **Extract text with precise bounding box coordinates:**
+    - 🎯 **X,Y coordinates** for every text element
+    - 📦 **Bounding box dimensions** (width, height)
+    - 🔢 **Confidence scores** for each detection
+    - 🏷️ **Data type classification** (date, currency, text, etc.)
+    """)
+    
+    if not LIBRARIES_AVAILABLE:
+        st.error("Missing required libraries. Install: `pip install streamlit pymupdf pytesseract pillow`")
+        return
+    
+    # Initialize extractor
+    extractor = OCRBoundingBoxExtractor()
+    
+    # Sidebar options
+    with st.sidebar:
+        st.header("⚙️ Options")
         
-        # Phone patterns
-        if re.match(r'\\(?\\d{3}\\)?[-\\s]?\\d{3}[-\\s]?\\d{4}', text):
-            return "phone"
+        show_visualization = st.checkbox("Show Bounding Box Visualization", value=True)
         
-        # Invoice number patterns
-        if re.match(r'[A-Z]{2,}-\\d+', text) or re.match(r'INV[A-Z0-9]+', text.upper()):
-            return "invoice_number"
+        st.header("🏷️ Filter by Data Type")
+        data_types = st.multiselect(
+            "Select data types to include:",
+            ["text", "date", "currency", "number", "email", "phone", "invoice_number", "percentage"],
+            default=["text", "date", "currency", "number", "invoice_number"]
+        )
         
-        # Percentage
-        if re.match(r'\\d+\\.?\\d*%', text):
-            return "percentage"
+        st.header("📊 Output Format")
+        json_format = st.selectbox(
+            "JSON Format:",
+            ["Pretty (indented)", "Compact (minified)"]
+        )
+    
+    # File upload
+    uploaded_file = st.file_uploader("Upload PDF Document", type="pdf")
+    
+    if uploaded_file:
+        st.success(f"✅ File uploaded: {uploaded_file.name}")
         
-        # Default to text
-        return "text"
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            if st.button("🚀 Extract Bounding Boxes", type="primary"):
+                with st.spinner("Extracting text with bounding boxes..."):
+                    # Reset file pointer
+                    uploaded_file.seek(0)
+                    result = extractor.extract_with_bounding_boxes(uploaded_file)
+                    
+                    if result["status"] == "error":
+                        st.error(f"Error: {result['message']}")
+                    else:
+                        st.success("✅ Extraction completed!")
+                        
+                        # Filter by data types if specified
+                        if data_types:
+                            result = extractor.filter_elements_by_type(result, data_types)
+                        
+                        st.session_state.result = result
+                        
+                        # Create visualization if requested
+                        if show_visualization:
+                            uploaded_file.seek(0)
+                            vis_img = extractor.create_visualization(uploaded_file, result)
+                            st.session_state.visualization = vis_img
+        
+        # Display results
+        if hasattr(st.session_state, 'result') and st.session_state.result:
+            result = st.session_state.result
+            
+            with col2:
+                st.subheader("📊 Extraction Summary")
+                
+                if result["status"] == "success":
+                    total_elements = sum([page["total_elements"] for page in result["pages"]])
+                    
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a:
+                        st.metric("Total Pages", result["total_pages"])
+                    with col_b:
+                        st.metric("Total Elements", total_elements)
+                    with col_c:
+                        avg_conf = 0
+                        conf_count = 0
+                        for page in result["pages"]:
+                            for element in page["elements"]:
+                                avg_conf += element["confidence"]
+                                conf_count += 1
+                        if conf_count > 0:
+                            avg_conf = avg_conf / conf_count
+                        st.metric("Avg Confidence", f"{avg_conf:.0f}%")
+            
+            # Detailed results in tabs
+            tab1, tab2, tab3, tab4 = st.tabs(["📦 Bounding Boxes", "🎯 Visualization", "📊 JSON Output", "📈 Statistics"])
+            
+            with tab1:
+                st.subheader("📦 Detected Elements with Bounding Boxes")
+                
+                if result["status"] == "success":
+                    for page in result["pages"]:
+                        st.write(f"**Page {page['page_number']} ({page['total_elements']} elements)**")
+                        
+                        # Create a table view
+                        if page["elements"]:
+                            table_data = []
+                            for element in page["elements"][:20]:  # Show first 20 elements
+                                bbox = element["bounding_box"]
+                                table_data.append({
+                                    "ID": element["element_id"],
+                                    "Text": element["text"][:30] + "..." if len(element["text"]) > 30 else element["text"],
+                                    "X": bbox["x"],
+                                    "Y": bbox["y"], 
+                                    "Width": bbox["width"],
+                                    "Height": bbox["height"],
+                                    "Type": element["data_type"],
+                                    "Confidence": f"{element['confidence']}%"
+                                })
+                            
+                            st.dataframe(table_data, use_container_width=True)
+                            
+                            if len(page["elements"]) > 20:
+                                st.info(f"Showing first 20 elements. Total: {len(page['elements'])} elements")
+                        else:
+                            st.warning("No elements found on this page")
+            
+            with tab2:
+                st.subheader("🎯 Bounding Box Visualization")
+                
+                if hasattr(st.session_state, 'visualization') and st.session_state.visualization:
+                    st.image(st.session_state.visualization, 
+                           caption="Bounding boxes colored by data type", 
+                           use_column_width=True)
+                    
+                    # Legend
+                    st.write("**Color Legend:**")
+                    legend_cols = st.columns(4)
+                    colors = [
+                        ("Date", "red"), ("Currency", "green"), 
+                        ("Number", "blue"), ("Text", "gray")
+                    ]
+                    for i, (label, color) in enumerate(colors):
+                        with legend_cols[i % 4]:
+                            st.markdown(f"🟦 {label}", unsafe_allow_html=True)
+                else:
+                    st.info("Enable visualization in sidebar to see bounding boxes")
+            
+            with tab3:
+                st.subheader("📊 Complete JSON Output")
+                
+                # Format JSON based on user preference
+                if json_format == "Pretty (indented)":
+                    json_output = json.dumps(result, indent=2)
+                else:
+                    json_output = json.dumps(result)
+                
+                st.code(json_output, language='json')
+                
+                # Download button
+                st.download_button(
+                    "📥 Download JSON",
+                    json_output,
+                    file_name=f"bounding_boxes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json"
+                )
+            
+            with tab4:
+                st.subheader("📈 Extraction Statistics")
+                
+                if result["status"] == "success":
+                    # Data type distribution
+                    type_counts = {}
+                    for page in result["pages"]:
+                        for element in page["elements"]:
+                            data_type = element["data_type"]
+                            type_counts[data_type] = type_counts.get(data_type, 0) + 1
+                    
+                    st.write("**Data Type Distribution:**")
+                    for data_type, count in sorted(type_counts.items()):
+                        st.write(f"- {data_type}: {count} elements")
+                    
+                    # Confidence distribution
+                    confidences = []
+                    for page in result["pages"]:
+                        for element in page["elements"]:
+                            confidences.append(element["confidence"])
+                    
+                    if confidences:
+                        st.write("**Confidence Statistics:**")
+                        st.write(f"- Min: {min(confidences)}%")
+                        st.write(f"- Max: {max(confidences)}%") 
+                        st.write(f"- Average: {sum(confidences)/len(confidences):.1f}%")
+    
+    else:
+        st.info("""
+        **Upload a PDF to extract:**
+        
+        📍 **Bounding Box Data:**
+        - X, Y coordinates for each text element
+        - Width and height of bounding boxes
+        - Top-left, top-right, bottom-left, bottom-right coordinates
+        
+        🏷️ **Data Classification:**
+        - Automatic detection of dates, currencies, numbers
+        - Invoice numbers, emails, phone numbers
+        - Confidence scores for each element
+        
+        📊 **JSON Output:**
+        - Complete structured data
+        - Ready for further processing
+        - Downloadable format
+        """)
+
+if __name__ == "__main__":
+    main()
+, text):
+                return "number"
+            
+            # Email patterns
+            if re.match(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text):
+                return "email"
+            
+            # Phone patterns
+            if re.match(r'\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}', text):
+                return "phone"
+            
+            # Invoice number patterns
+            if re.match(r'[A-Z]{2,}-\d+', text) or re.match(r'INV[A-Z0-9]+', text.upper()):
+                return "invoice_number"
+            
+            # Percentage
+            if re.match(r'\d+\.?\d*%', text):
+                return "percentage"
+            
+            # Default to text
+            return "text"
+            
+        except Exception as e:
+            # If any regex fails, default to text
+            return "text"
     
     def create_visualization(self, pdf_file, ocr_result):
         """Create a visualization showing bounding boxes on the image"""
